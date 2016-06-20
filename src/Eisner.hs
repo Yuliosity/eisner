@@ -1,3 +1,5 @@
+{-# LANGUAGE ExplicitForAll, TypeFamilies, ScopedTypeVariables #-}
+
 module Language.Algorithms.Eisner
     ( runEisner
     )
@@ -6,131 +8,126 @@ module Language.Algorithms.Eisner
 import Control.Monad
 import Control.Monad.Trans.State
 import Data.Function (on)
-import Data.List (minimumBy)
+import Data.List (minimumBy, partition)
 import qualified Data.Map as M
 import Data.Maybe
 
 type Position = Int
-
-data Direction = DirLeft | DirRight
-    deriving (Eq, Ord)
-revDir :: Direction -> Direction
-revDir DirLeft = DirRight
-revDir DirRight = DirLeft
+class Positioned a where
+    position :: a -> Position
 
 type Weight = Double
-
-data Node d = Node
-    { nodePos :: !Position
-    , nodeData :: d
-    }
-
-instance Eq (Node d) where
-    (==) = (==) `on` nodePos
-
-instance Ord (Node d) where
-    compare = compare `on` nodePos
-
-data Link n d = Link
-    { linkFather, linkChild :: Node n
-    , linkWeight :: !Weight
-    , linkDir :: !Direction
-    , linkData :: d
-    }
-
-data PathType n l = PathElementary
-                  | PathConcat (Path n l) (Path n l)
-                  | PathJoin (Path n l) (Path n l) (Link n l)
-
-data Path n l = Path
-    { headNode :: Node n
-    , pathType :: PathType n l
-    , pathWeight :: !Weight
-    , pathDir :: !Direction
-    }
 
 class Weighed a where
     weight :: a -> Weight
 
-instance Weighed (Path n l) where
-    weight = pathWeight
-
-instance Weighed (Link n l) where
-    weight = linkWeight
-
 compWeight :: Weighed a => a -> a -> Ordering
 compWeight = compare `on` weight
 
-elemPath :: Direction -> Node n -> Path n l
-elemPath dir node = Path
+data Direction = DirLeft | DirRight
+    deriving (Eq, Ord)
+
+data Left
+data Right
+
+type family RevDir a :: * where
+    RevDir Left = Right
+    RevDir Right = Left
+
+data Link d n l = Link
+    { linkFather, linkChild :: n
+    , linkData :: l
+    }
+
+data PathType d n l
+    = PathElementary
+    | PathConcat (Path d n l)
+    | PathJoin (Link d n l) (Path (RevDir d) n l)
+
+data Path d n l = Path
+    { headNode :: n
+    , pathType :: PathType d n l
+    , pathWeight :: !Weight
+    }
+
+instance Weighed (Path d n l) where
+    weight = pathWeight
+
+instance Weighed l => Weighed (Link d n l) where
+    weight = weight . linkData
+
+elemPath :: n -> Path d n l
+elemPath node = Path
     { headNode = node
     , pathType = PathElementary
     , pathWeight = 0.0
-    , pathDir = dir
     }
 
-concatPath :: Path n l -> Path n l -> Maybe (Path n l)
-concatPath first second = res where
-    res = case (pathDir first, pathDir second) of
-              (DirRight, DirRight) -> concatImpl first second
-              (DirLeft, DirLeft)   -> concatImpl second first
-              _ -> Nothing
-    concatImpl father child = Just Path
-        { headNode = headNode father
-        , pathType = PathConcat father child
-        , pathWeight = pathWeight father + pathWeight child
-        , pathDir = pathDir father
-        }
+-- TODO: should we need to re-check positions here?
+concatPath :: Weighed l => Path d n l -> Path d n l -> Path d n l
+concatPath father child = Path
+    { headNode = headNode father
+    , pathType = PathConcat child
+    , pathWeight = weight father + weight child
+    }
 
-joinPath :: Link n l -> Path n l -> Path n l -> Maybe (Path n l)
-joinPath link first second = res where
-    res = case (pathDir first, pathDir second, linkDir link) of
-              (DirRight, DirLeft, DirRight) -> joinImpl first second
-              (DirRight, DirLeft, DirLeft)  -> joinImpl second first
-              _ -> Nothing
-
-    joinImpl father child = Just Path
-        { headNode = headNode father
-        , pathType = PathJoin father child link
-        , pathWeight = pathWeight father + pathWeight child + linkWeight link
-        , pathDir = linkDir link
-        }
+-- TODO: should we need to re-check positions here?
+joinPath :: Weighed l => Link d n l -> Path d n l -> Path (RevDir d) n l -> Path d n l
+joinPath link father child = Path
+    { headNode = headNode father
+    , pathType = PathJoin link child
+    , pathWeight = weight father + weight child + weight link
+    }
 
 data Tree n = Branch n [Tree n]
 
-runEisner :: [Node w] -> [((Node w, Node w), Link w l)] -> Maybe (Path w l)
-runEisner sentence links = M.lookup (0, length sentence - 1, DirLeft) finalGraph where
-    graph = M.fromList links
+type LinkGraph d n l = M.Map (Int, Int) (Link d n l)
+type PathGraph d n l = M.Map (Int, Int) (Path d n l)
+
+runEisner :: forall n l . (Positioned n, Weighed l) => [n] -> [(n, n, l)] -> Maybe (Path Left n l)
+runEisner sentence links = M.lookup (0, length sentence) finalGraph where
+    (leftLinks, rightLinks) = partition (\(n1, n2, _) -> position n1 < position n2) links
+    lgraph :: M.Map (Int, Int) (Link Left n l)
+    lgraph = M.fromList $ map (\(n1, n2, link) -> ((position n1, position n2), Link n2 n1 link)) leftLinks
+    rgraph :: M.Map (Int, Int) (Link Right n l)
+    rgraph = M.fromList $ map (\(n1, n2, link) -> ((position n1, position n2), Link n1 n2 link)) rightLinks
     indexed = zip [0 ..] sentence
-    --startMatrix :: M.Map (Position, Position, Direction) (Path w l)
+    startMatrix :: M.Map (Int, Int) (Path d n l)
     startMatrix = M.fromList
-        [ ((i, i, dir), elemPath dir node)
-        | dir <- [DirLeft, DirRight]
-        , (i, node) <- indexed
+        [ ((i, i), elemPath node)
+        | (i, node) <- indexed
         ]
-    finalGraph = flip execState startMatrix $ do
+    finalGraph = fst $ flip execState (startMatrix :: PathGraph Left n l, startMatrix :: PathGraph Right n l) $ do
         let len = length sentence
         -- TODO: check boundaries
-        forM_ [(i, l, (node1, node2)) | (l, node1) <- tail indexed, (i, node2) <- drop l indexed] $
-            \(i, l, coords) -> do
-            matrix <- get
-            let j = i + l
-            let buildConcat dir = catMaybes
-                    [ join $ liftM2 concatPath path1 path2
+        forM_ [ (i, j, (position node1, position node2))
+              | (j, node1) <- tail indexed, (i, node2) <- drop j indexed] $
+            \(i, j, key) -> do
+            (lmatrix, rmatrix) <- get
+            let buildConcat :: PathGraph d n l -> [Path d n l]
+                buildConcat matrix = catMaybes
+                    [ liftM2 concatPath path1 path2
                     | k <- [i + 1 .. j - 1]
-                    , let path1 = M.lookup (i, k, dir) matrix
-                    , let path2 = M.lookup (k, j, dir) matrix
+                    , let path1 = M.lookup (i, k) matrix
+                    , let path2 = M.lookup (k, j) matrix
                     ]
 
-            let buildJoin dir key = case M.lookup key graph of
+            let buildJoin :: LinkGraph d n l -> PathGraph d n l -> PathGraph (RevDir d) n l -> [Path d n l]
+                buildJoin links m1 m2 = case M.lookup key links of
                     Nothing -> []
                     Just link -> catMaybes
-                        [ join $ liftM2 (joinPath link) path1 path2
+                        [ liftM2 (joinPath link) path1 path2
                         | k <- [i .. j - 1]
-                        , let path1 = M.lookup (i, k, dir) matrix
-                        , let path2 = M.lookup (k + 1, j, revDir dir) matrix
+                        , let path1 = M.lookup (i, k) m1
+                        , let path2 = M.lookup (k + 1, j) m2
                         ]
 
-            forM_ [DirLeft, DirRight] $ \dir -> do
-                let pos = buildConcat dir ++ buildJoin dir coords
-                unless (null pos) $ modify (M.insert (i, j, dir) (minimumBy compWeight pos))
+            let posLeft :: [Path Left n l]
+                posLeft  = buildConcat lmatrix ++ buildJoin lgraph lmatrix rmatrix
+                posRight = buildConcat rmatrix ++ buildJoin rgraph rmatrix lmatrix
+
+            let lmatrix' = if null posLeft  then lmatrix
+                               else M.insert (i, j) (minimumBy compWeight posLeft)  lmatrix
+                rmatrix' = if null posRight then rmatrix
+                               else M.insert (i, j) (minimumBy compWeight posRight) rmatrix
+            put (lmatrix', rmatrix')

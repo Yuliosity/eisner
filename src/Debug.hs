@@ -1,11 +1,11 @@
-module Language.Eisner.Debug
+module Language.Algorithms.Eisner.Debug
     (
 
     ) where
 
 import Text.Printf
 
-import Language.Eisner
+import Language.Algorithms.Eisner
 
 testShow2 :: Path -> String
 testShow2 (Path {subpathes = Nothing, pathWeight = w}) = show w

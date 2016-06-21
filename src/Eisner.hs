@@ -1,8 +1,8 @@
-{-# LANGUAGE ExplicitForAll, TypeFamilies, ScopedTypeVariables #-}
+{-# LANGUAGE ExplicitForAll, ScopedTypeVariables #-}
 
-module Language.Algorithms.Eisner
-    ( runEisner
-    )
+module Eisner
+    --( runEisner
+    --)
     where
 
 import Control.Monad
@@ -30,22 +30,18 @@ data Direction = DirLeft | DirRight
 data Left
 data Right
 
-type family RevDir a :: * where
-    RevDir Left = Right
-    RevDir Right = Left
-
 data Link d n l = Link
-    { linkFather, linkChild :: n
-    , linkData :: l
+    { linkFather, linkChild :: !n
+    , linkData :: !l
     }
 
 data PathType d n l
     = PathElementary
-    | PathConcat (Path d n l)
-    | PathJoin (Link d n l) (Path (RevDir d) n l)
+    | PathConcat (Path d n l) (Path d n l)
+    | PathJoin (Link d n l) (Path Right n l) (Path Left n l)
 
 data Path d n l = Path
-    { headNode :: n
+    { headNode :: !n
     , pathType :: PathType d n l
     , pathWeight :: !Weight
     }
@@ -67,28 +63,49 @@ elemPath node = Path
 concatPath :: Weighed l => Path d n l -> Path d n l -> Path d n l
 concatPath father child = Path
     { headNode = headNode father
-    , pathType = PathConcat child
+    , pathType = PathConcat father child
     , pathWeight = weight father + weight child
     }
 
 -- TODO: should we need to re-check positions here?
-joinPath :: Weighed l => Link d n l -> Path d n l -> Path (RevDir d) n l -> Path d n l
-joinPath link father child = Path
-    { headNode = headNode father
-    , pathType = PathJoin link child
-    , pathWeight = weight father + weight child + weight link
-    }
+class Joined d where
+    joinPath :: Weighed l => Link d n l -> Path Right n l -> Path Left n l -> Path d n l
 
-data Tree n = Branch n [Tree n]
+instance Joined Right where
+    joinPath link right left = Path
+        { headNode = headNode right
+        , pathType = PathJoin link right left
+        , pathWeight = weight right + weight left + weight link
+        }
+
+instance Joined Left where
+    joinPath link right left = Path
+        { headNode = headNode left
+        , pathType = PathJoin link right left
+        , pathWeight = weight right + weight left + weight link
+        }
+
+--data Tree n l = Branch n [Tree n l]
+
+--pathToTree :: Path d n l -> Tree n l
+--pathToTree (Path {headNode = n, pathType = ElementaryPath}) = Branch n []
+--pathToTree (Path {headNode = n, pathType = PathConcat c}) =
+pathToLinks :: Path d n l -> [(n, n, l)]
+pathToLinks (Path {pathType = PathElementary}) = []
+pathToLinks (Path {pathType = PathConcat f c}) = pathToLinks f ++ pathToLinks c
+pathToLinks (Path {pathType = PathJoin (Link n1 n2 l) f c}) = (n1, n2, l):pathToLinks f ++ pathToLinks c
 
 type LinkGraph d n l = M.Map (Int, Int) (Link d n l)
 type PathGraph d n l = M.Map (Int, Int) (Path d n l)
 
 runEisner :: forall n l . (Positioned n, Weighed l) => [n] -> [(n, n, l)] -> Maybe (Path Left n l)
-runEisner sentence links = M.lookup (0, length sentence) finalGraph where
-    (leftLinks, rightLinks) = partition (\(n1, n2, _) -> position n1 < position n2) links
+runEisner sentence links = M.lookup (0, length sentence - 1) $ fst $ testEisner sentence links
+
+testEisner :: forall n l . (Positioned n, Weighed l) => [n] -> [(n, n, l)] -> (PathGraph Left n l, PathGraph Right n l)
+testEisner sentence links = finalGraphs where
+    (leftLinks, rightLinks) = partition (\(n1, n2, _) -> position n1 > position n2) links
     lgraph :: M.Map (Int, Int) (Link Left n l)
-    lgraph = M.fromList $ map (\(n1, n2, link) -> ((position n1, position n2), Link n2 n1 link)) leftLinks
+    lgraph = M.fromList $ map (\(n1, n2, link) -> ((position n2, position n1), Link n1 n2 link)) leftLinks
     rgraph :: M.Map (Int, Int) (Link Right n l)
     rgraph = M.fromList $ map (\(n1, n2, link) -> ((position n1, position n2), Link n1 n2 link)) rightLinks
     indexed = zip [0 ..] sentence
@@ -97,12 +114,13 @@ runEisner sentence links = M.lookup (0, length sentence) finalGraph where
         [ ((i, i), elemPath node)
         | (i, node) <- indexed
         ]
-    finalGraph = fst $ flip execState (startMatrix :: PathGraph Left n l, startMatrix :: PathGraph Right n l) $ do
+    finalGraphs = flip execState (startMatrix :: PathGraph Left n l, startMatrix :: PathGraph Right n l) $ do
         let len = length sentence
         -- TODO: check boundaries
-        forM_ [ (i, j, (position node1, position node2))
-              | (j, node1) <- tail indexed, (i, node2) <- drop j indexed] $
-            \(i, j, key) -> do
+        forM_ [ (i, j)
+              | l <- [1 .. len - 1], i <- [0 .. len - 1 - l], let j = i + l] $
+            \(i, j) -> do
+            let key = (position (sentence !! i), position (sentence !! j))
             (lmatrix, rmatrix) <- get
             let buildConcat :: PathGraph d n l -> [Path d n l]
                 buildConcat matrix = catMaybes
@@ -112,7 +130,7 @@ runEisner sentence links = M.lookup (0, length sentence) finalGraph where
                     , let path2 = M.lookup (k, j) matrix
                     ]
 
-            let buildJoin :: LinkGraph d n l -> PathGraph d n l -> PathGraph (RevDir d) n l -> [Path d n l]
+            let buildJoin :: Joined d => LinkGraph d n l -> PathGraph Right n l -> PathGraph Left n l -> [Path d n l]
                 buildJoin links m1 m2 = case M.lookup key links of
                     Nothing -> []
                     Just link -> catMaybes
@@ -123,7 +141,7 @@ runEisner sentence links = M.lookup (0, length sentence) finalGraph where
                         ]
 
             let posLeft :: [Path Left n l]
-                posLeft  = buildConcat lmatrix ++ buildJoin lgraph lmatrix rmatrix
+                posLeft  = buildConcat lmatrix ++ buildJoin lgraph rmatrix lmatrix
                 posRight = buildConcat rmatrix ++ buildJoin rgraph rmatrix lmatrix
 
             let lmatrix' = if null posLeft  then lmatrix
